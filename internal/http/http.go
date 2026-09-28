@@ -22,7 +22,7 @@ var statusTemplate = spi.TemplateInfo{
 // StatusProvider is implemented by the plugin itself, to keep this package from depending on
 // it directly (which would be an import cycle, since the plugin package depends on this one).
 type StatusProvider interface {
-	GetStatus() data.PluginStatus
+	GetStatus() (data.PluginStatus, error)
 }
 
 type Handler struct {
@@ -46,7 +46,12 @@ func (h *Handler) Init(container spi.IPMAASContainer, status StatusProvider) {
 }
 
 func (h *Handler) handleHttpStatusRequest(writer http.ResponseWriter, request *http.Request) {
-	status := h.status.GetStatus()
+	status, err := h.status.GetStatus()
+
+	if err != nil {
+		fmt.Printf("acme.http handleHttpStatusRequest: Error retrieving status: %s\n", err)
+		status = data.PluginStatus{}
+	}
 
 	h.container.RenderList(
 		writer,

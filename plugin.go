@@ -15,11 +15,6 @@ import (
 	"github.com/avanha/pmaas-plugin-acme/internal/http"
 )
 
-const (
-	defaultRenewalCheckInterval = 12 * time.Hour
-	defaultRenewalRetryInterval = 5 * time.Minute
-)
-
 type plugin struct {
 	config      config.PluginConfig
 	container   spi.IPMAASContainer
@@ -28,6 +23,18 @@ type plugin struct {
 
 	cancelFn  context.CancelFunc
 	workersWg sync.WaitGroup
+
+	// registrationURI/commonName/refreshedTime/expiresTime/lastErrorMessage/lastErrorTime are
+	// for status-page display (see GetStatus). They're updated only via
+	// onCertificateStateChanged/onCertificateError, which always run on this plugin's own
+	// mailbox goroutine (see Init/handleCertificateStateChanged/recordError), so reading them
+	// safely requires going through that same goroutine too - see getStatus.
+	registrationURI  string
+	commonName       string
+	refreshedTime    time.Time
+	expiresTime      time.Time
+	lastErrorMessage string
+	lastErrorTime    time.Time
 }
 
 type Plugin interface {
@@ -49,18 +56,26 @@ func (p *plugin) ShortName() string {
 func (p *plugin) Init(container spi.IPMAASContainer) {
 	p.container = container
 
-	initialState := p.loadPersistedState()
+	persisted := p.loadPersistedState()
+	p.registrationURI = persisted.RegistrationURI
+	p.commonName = certmanager.ParseCommonName(persisted.CertificatePEM)
+	p.refreshedTime = persisted.IssuedAt
+	p.expiresTime = persisted.NotAfter
 
 	certManager, err := certmanager.NewManager(certmanager.Config{
 		Domains:                   p.config.Domains,
 		Email:                     p.config.Email,
 		DirectoryURL:              p.config.DirectoryURL,
 		RenewBeforeExpiry:         p.config.RenewBeforeExpiry,
+		RenewalCheckInterval:      p.config.RenewalCheckInterval,
+		RenewalRetryInterval:      p.config.RenewalRetryInterval,
 		PorkbunAPIKey:             p.config.Porkbun.ApiKey,
 		PorkbunAPISecret:          p.config.Porkbun.ApiSecret,
 		PorkbunPropagationTimeout: p.config.Porkbun.PropagationTimeout,
 		PorkbunPollingInterval:    p.config.Porkbun.PollingInterval,
-		InitialState:              initialState,
+		InitialState:              persisted,
+		OnStateChanged:            p.onCertificateStateChanged,
+		OnError:                   p.onCertificateError,
 	})
 
 	if err != nil {
@@ -75,22 +90,6 @@ func (p *plugin) Init(container spi.IPMAASContainer) {
 	// handshake that arrives before the first certificate has been obtained (see Start).
 	if err := container.ProvideTLSCertificate(p.certManager.GetCertificate); err != nil {
 		panic(fmt.Errorf("%T failed to register as the TLS certificate provider: %w", p, err))
-	}
-}
-
-// GetStatus implements internal/http.StatusProvider, for the plugin's status page.
-func (p *plugin) GetStatus() data.PluginStatus {
-	status := p.certManager.Status()
-
-	return data.PluginStatus{
-		Domains:          status.Domains,
-		Email:            status.Email,
-		RegistrationURI:  status.RegistrationURI,
-		CommonName:       status.CommonName,
-		RefreshedTime:    status.RefreshedTime,
-		ExpiresTime:      status.ExpiresTime,
-		LastErrorMessage: status.LastErrorMessage,
-		LastErrorTime:    status.LastErrorTime,
 	}
 }
 
@@ -122,20 +121,10 @@ func (p *plugin) loadPersistedState() certmanager.State {
 	}
 }
 
-// Start makes one attempt to obtain a certificate synchronously - so that, so long as it
-// succeeds, the HTTP server (which only starts listening once every plugin has finished
-// starting) never begins serving TLS without a certificate in hand - then starts a
-// background loop that keeps the certificate renewed. If the initial attempt fails, it's
-// logged and left to the background loop to keep retrying rather than blocking startup
-// forever; GetCertificate errors out any handshake that arrives before it succeeds.
 func (p *plugin) Start() {
-	if err := p.obtainAndPersist(); err != nil {
-		fmt.Printf("%T initial certificate acquisition failed, will keep retrying in the background: %v\n", p, err)
-	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancelFn = cancel
-	p.workersWg.Go(func() { p.renewalLoop(ctx) })
+	p.workersWg.Go(func() { p.certManager.Run(ctx) })
 }
 
 func (p *plugin) Stop() chan func() {
@@ -150,53 +139,27 @@ func (p *plugin) Stop() chan func() {
 	return callbackCh
 }
 
-func (p *plugin) renewalLoop(ctx context.Context) {
-	for {
-		interval := p.renewalCheckInterval()
-		if p.certManager.NeedsRenewal() {
-			interval = p.renewalRetryInterval()
-		}
+// onCertificateStateChanged is certManager's OnStateChanged callback (see Init): called from its
+// own background goroutine (see Start) whenever the ACME registration and/or certificate
+// changes, mirroring how pmaas-plugin-nestthermostat's poller reports data it fetches back to
+// its plugin via callback.
+func (p *plugin) onCertificateStateChanged(state certmanager.State) {
+	err := p.container.EnqueueOnPluginGoRoutine(func() { p.handleCertificateStateChanged(state) })
 
-		timer := time.NewTimer(interval)
-
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-
-		if err := p.obtainAndPersist(); err != nil {
-			fmt.Printf("%T certificate renewal attempt failed, will retry: %v\n", p, err)
-		}
+	if err != nil {
+		fmt.Printf("%T Failed to enqueue certificate state update: %v\n", p, err)
 	}
 }
 
-func (p *plugin) renewalCheckInterval() time.Duration {
-	if p.config.RenewalCheckInterval > 0 {
-		return p.config.RenewalCheckInterval
-	}
+// handleCertificateStateChanged updates status-page state and persists it. Runs on the plugin's
+// own mailbox goroutine (see onCertificateStateChanged).
+func (p *plugin) handleCertificateStateChanged(state certmanager.State) {
+	p.registrationURI = state.RegistrationURI
+	p.commonName = state.CommonName
+	p.refreshedTime = state.IssuedAt
+	p.expiresTime = state.NotAfter
 
-	return defaultRenewalCheckInterval
-}
-
-func (p *plugin) renewalRetryInterval() time.Duration {
-	if p.config.RenewalRetryInterval > 0 {
-		return p.config.RenewalRetryInterval
-	}
-
-	return defaultRenewalRetryInterval
-}
-
-// obtainAndPersist asks the certificate manager to (re)obtain a certificate if needed, then
-// persists its current state regardless of whether a new certificate was actually issued -
-// registering the ACME account can itself change persistable state (the registration URI)
-// even on a call where certificate issuance goes on to fail.
-func (p *plugin) obtainAndPersist() error {
-	ensureErr := p.certManager.EnsureCertificate()
-
-	state := p.certManager.State()
-	saveErr := p.container.SaveConfig(config.PersistentConfigV1{
+	err := p.container.SaveConfig(config.PersistentConfigV1{
 		AccountPrivateKeyPEM: state.AccountPrivateKeyPEM,
 		RegistrationURI:      state.RegistrationURI,
 		CertificatePEM:       state.CertificatePEM,
@@ -205,9 +168,50 @@ func (p *plugin) obtainAndPersist() error {
 		NotAfter:             state.NotAfter,
 	})
 
-	if saveErr != nil {
-		fmt.Printf("%T failed to persist certificate state: %v\n", p, saveErr)
+	if err != nil {
+		fmt.Printf("%T failed to persist certificate state: %v\n", p, err)
 	}
+}
 
-	return ensureErr
+// onCertificateError is certManager's OnError callback (see Init): called from its own
+// background goroutine (see Start) whenever registering the account or obtaining/renewing the
+// certificate fails.
+func (p *plugin) onCertificateError(certErr error) {
+	err := p.container.EnqueueOnPluginGoRoutine(func() { p.recordError(certErr) })
+
+	if err != nil {
+		fmt.Printf("%T Failed to enqueue certificate error (%v): %v\n", p, certErr, err)
+	}
+}
+
+// recordError records err as the plugin's most recent error, for status-page display. Runs on
+// the plugin's own mailbox goroutine (see onCertificateError).
+func (p *plugin) recordError(err error) {
+	p.lastErrorMessage = err.Error()
+	p.lastErrorTime = time.Now()
+	fmt.Printf("%T Error: %v\n", p, err)
+}
+
+// GetStatus implements internal/http.StatusProvider, for the plugin's status page. HTTP
+// requests come in on arbitrary goroutines, so it reads status fields on the plugin's own
+// mailbox goroutine to get them all atomically.
+func (p *plugin) GetStatus() (data.PluginStatus, error) {
+	return spi.ExecValueFunctionOnPluginGoRoutine(
+		p.container,
+		p.getStatus,
+		func() data.PluginStatus { return data.PluginStatus{} },
+		"unable to get status")
+}
+
+func (p *plugin) getStatus() data.PluginStatus {
+	return data.PluginStatus{
+		Domains:          p.config.Domains,
+		Email:            p.config.Email,
+		RegistrationURI:  p.registrationURI,
+		CommonName:       p.commonName,
+		RefreshedTime:    p.refreshedTime,
+		ExpiresTime:      p.expiresTime,
+		LastErrorMessage: p.lastErrorMessage,
+		LastErrorTime:    p.lastErrorTime,
+	}
 }

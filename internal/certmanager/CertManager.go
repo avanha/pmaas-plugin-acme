@@ -1,11 +1,11 @@
 package certmanager
 
 import (
+	"context"
 	"crypto"
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"slices"
 	"sync"
 	"time"
 
@@ -20,23 +20,53 @@ import (
 
 const (
 	defaultRenewBeforeExpiry     = 30 * 24 * time.Hour
+	defaultRenewalCheckInterval  = 12 * time.Hour
+	defaultRenewalRetryInterval  = 5 * time.Minute
 	defaultPropagationTimeout    = 2 * time.Minute
 	defaultPropagationPollPeriod = 5 * time.Second
 	accountKeyType               = certcrypto.EC256
 	certificateKeyType           = certcrypto.EC256
 )
 
-// State is the manager's full ACME account + certificate state - exactly what a caller needs
-// to persist across restarts and to hand back in as Config.InitialState to resume without
-// re-registering the account or re-issuing a still-valid certificate.
+// State is the manager's account registration + certificate data, handed to Config.OnStateChanged
+// whenever it changes (see Run) - both the raw material a caller needs to persist across restarts
+// (AccountPrivateKeyPEM/CertificatePEM/CertificateKeyPEM) and the fields worth showing on a status
+// page (RegistrationURI/CommonName/IssuedAt/NotAfter).
 type State struct {
 	AccountPrivateKeyPEM []byte
 	RegistrationURI      string
 
 	CertificatePEM    []byte
 	CertificateKeyPEM []byte
+	CommonName        string
 	IssuedAt          time.Time
 	NotAfter          time.Time
+}
+
+// StateChangedFunc is called, from Run's own goroutine, whenever the account registration
+// and/or certificate changes - mirroring how pmaas-plugin-nestthermostat's poller reports data
+// it fetches back to its plugin via callback, rather than the plugin polling for it.
+type StateChangedFunc func(State)
+
+// ErrorFunc is called, from Run's own goroutine, whenever registering the account or
+// obtaining/renewing the certificate fails.
+type ErrorFunc func(error)
+
+// ParseCommonName returns certPEM's leaf certificate's Subject.CommonName, or "" if certPEM is
+// empty or can't be parsed. Exported so a caller resuming from persisted State (which carries
+// CertificatePEM but not the CommonName the certificate manager derived from it last time it was
+// obtained - see State) can recover it without duplicating certificate-parsing logic.
+func ParseCommonName(certPEM []byte) string {
+	if len(certPEM) == 0 {
+		return ""
+	}
+
+	cert, err := certcrypto.ParsePEMCertificate(certPEM)
+	if err != nil {
+		return ""
+	}
+
+	return cert.Subject.CommonName
 }
 
 type Config struct {
@@ -44,7 +74,9 @@ type Config struct {
 	Email        string
 	DirectoryURL string
 
-	RenewBeforeExpiry time.Duration
+	RenewBeforeExpiry    time.Duration
+	RenewalCheckInterval time.Duration
+	RenewalRetryInterval time.Duration
 
 	PorkbunAPIKey             string
 	PorkbunAPISecret          string
@@ -54,42 +86,39 @@ type Config struct {
 	// InitialState resumes a previously persisted account/certificate. Its zero value is a
 	// valid "nothing persisted yet" starting point.
 	InitialState State
+
+	OnStateChanged StateChangedFunc
+	OnError        ErrorFunc
 }
 
-// Manager owns an ACME account and the currently valid certificate for Config.Domains,
-// obtaining and renewing it via lego, using DNS-01 challenges answered through Porkbun.
+// Manager owns an ACME account and, once Run is started, the currently valid certificate for
+// Config.Domains, obtaining and renewing it via lego, using DNS-01 challenges answered through
+// Porkbun.
 type Manager struct {
-	domains           []string
-	renewBeforeExpiry time.Duration
+	domains              []string
+	renewBeforeExpiry    time.Duration
+	renewalCheckInterval time.Duration
+	renewalRetryInterval time.Duration
+	onStateChanged       StateChangedFunc
+	onError              ErrorFunc
 
 	user   *acmeuser.User
 	client *lego.Client
 
-	mu         sync.RWMutex
-	tlsCert    *tls.Certificate
+	// certPEM/keyPEM/commonName/issuedAt are only ever read or written from Run's own
+	// goroutine - the sole caller of obtainCertificate and currentState - so, unlike
+	// tlsCert/notAfter, they need no locking.
 	certPEM    []byte
 	keyPEM     []byte
 	commonName string
 	issuedAt   time.Time
-	notAfter   time.Time
 
-	lastErrorMessage string
-	lastErrorTime    time.Time
-}
-
-// Status is a read-only snapshot of the manager's account/certificate state, for status-page
-// display.
-type Status struct {
-	Domains         []string
-	Email           string
-	RegistrationURI string
-
-	CommonName    string
-	RefreshedTime time.Time
-	ExpiresTime   time.Time
-
-	LastErrorMessage string
-	LastErrorTime    time.Time
+	// mu guards tlsCert and notAfter, since GetCertificate/needsRenewal read them concurrently
+	// from arbitrary goroutines (one per incoming TLS handshake - see
+	// IPMAASContainer.ProvideTLSCertificate) while Run's own goroutine writes them.
+	mu       sync.RWMutex
+	tlsCert  *tls.Certificate
+	notAfter time.Time
 }
 
 func NewManager(cfg Config) (*Manager, error) {
@@ -99,6 +128,10 @@ func NewManager(cfg Config) (*Manager, error) {
 
 	if cfg.PorkbunAPIKey == "" || cfg.PorkbunAPISecret == "" {
 		return nil, errors.New("certmanager: Porkbun API key/secret are required for DNS-01 challenges")
+	}
+
+	if cfg.OnStateChanged == nil || cfg.OnError == nil {
+		return nil, errors.New("certmanager: OnStateChanged and OnError callbacks are required")
 	}
 
 	privateKey, err := loadOrGenerateAccountKey(cfg.InitialState.AccountPrivateKeyPEM)
@@ -138,24 +171,23 @@ func NewManager(cfg Config) (*Manager, error) {
 	}
 
 	m := &Manager{
-		domains:           cfg.Domains,
-		renewBeforeExpiry: orDefault(cfg.RenewBeforeExpiry, defaultRenewBeforeExpiry),
-		user:              user,
-		client:            client,
+		domains:              cfg.Domains,
+		renewBeforeExpiry:    orDefault(cfg.RenewBeforeExpiry, defaultRenewBeforeExpiry),
+		renewalCheckInterval: orDefault(cfg.RenewalCheckInterval, defaultRenewalCheckInterval),
+		renewalRetryInterval: orDefault(cfg.RenewalRetryInterval, defaultRenewalRetryInterval),
+		onStateChanged:       cfg.OnStateChanged,
+		onError:              cfg.OnError,
+		user:                 user,
+		client:               client,
 	}
 
 	if len(cfg.InitialState.CertificatePEM) > 0 && len(cfg.InitialState.CertificateKeyPEM) > 0 {
 		tlsCert, err := tls.X509KeyPair(cfg.InitialState.CertificatePEM, cfg.InitialState.CertificateKeyPEM)
-		x509Cert, x509Err := certcrypto.ParsePEMCertificate(cfg.InitialState.CertificatePEM)
 
-		if err != nil || x509Err != nil {
-			fmt.Printf("certmanager: discarding persisted certificate, unable to parse: %v\n", errors.Join(err, x509Err))
+		if err != nil {
+			fmt.Printf("certmanager: discarding persisted certificate, unable to parse: %v\n", err)
 		} else {
 			m.tlsCert = &tlsCert
-			m.certPEM = cfg.InitialState.CertificatePEM
-			m.keyPEM = cfg.InitialState.CertificateKeyPEM
-			m.commonName = x509Cert.Subject.CommonName
-			m.issuedAt = cfg.InitialState.IssuedAt
 			m.notAfter = cfg.InitialState.NotAfter
 		}
 	}
@@ -179,25 +211,50 @@ func orDefault(value, fallback time.Duration) time.Duration {
 	return fallback
 }
 
-// NeedsRenewal reports whether the current certificate is missing or within
-// renewBeforeExpiry of its expiry.
-func (m *Manager) NeedsRenewal() bool {
+// Run keeps the certificate renewed until ctx is done, reporting every attempt's outcome via
+// Config.OnStateChanged/OnError - mirroring how pmaas-plugin-nestthermostat's poller reports back
+// to its plugin via callback rather than the plugin polling it. Unlike that poller, which can
+// afford an initial delay before its first fetch, the first renewal check here happens immediately:
+// a brand new deployment has no certificate at all yet, so there's no reason to wait.
+func (m *Manager) Run(ctx context.Context) {
+	for {
+		if m.needsRenewal() {
+			if err := m.obtainCertificate(); err != nil {
+				m.onError(err)
+			} else {
+				m.onStateChanged(m.currentState())
+			}
+		}
+
+		interval := m.renewalCheckInterval
+		if m.needsRenewal() {
+			interval = m.renewalRetryInterval
+		}
+
+		timer := time.NewTimer(interval)
+
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// needsRenewal reports whether the current certificate is missing or within renewBeforeExpiry
+// of its expiry.
+func (m *Manager) needsRenewal() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	return m.tlsCert == nil || time.Until(m.notAfter) <= m.renewBeforeExpiry
 }
 
-// EnsureCertificate registers the ACME account if needed, then obtains a new certificate if
-// the current one is missing or nearing expiry. It's a no-op (returning nil) if the current
-// certificate is still comfortably valid.
-func (m *Manager) EnsureCertificate() error {
-	if !m.NeedsRenewal() {
-		return nil
-	}
-
+// obtainCertificate registers the ACME account if needed, then unconditionally obtains a new
+// certificate - it's Run's job to call this only when needsRenewal is true.
+func (m *Manager) obtainCertificate() error {
 	if err := m.ensureRegistered(); err != nil {
-		m.recordError(err)
 		return err
 	}
 
@@ -207,46 +264,30 @@ func (m *Manager) EnsureCertificate() error {
 	})
 
 	if err != nil {
-		err = fmt.Errorf("certmanager: obtaining certificate: %w", err)
-		m.recordError(err)
-		return err
+		return fmt.Errorf("certmanager: obtaining certificate: %w", err)
 	}
 
 	x509Cert, err := certcrypto.ParsePEMCertificate(resource.Certificate)
 	if err != nil {
-		err = fmt.Errorf("certmanager: parsing issued certificate: %w", err)
-		m.recordError(err)
-		return err
+		return fmt.Errorf("certmanager: parsing issued certificate: %w", err)
 	}
 
 	tlsCert, err := tls.X509KeyPair(resource.Certificate, resource.PrivateKey)
 	if err != nil {
-		err = fmt.Errorf("certmanager: building TLS certificate: %w", err)
-		m.recordError(err)
-		return err
+		return fmt.Errorf("certmanager: building TLS certificate: %w", err)
 	}
 
-	m.mu.Lock()
-	m.tlsCert = &tlsCert
 	m.certPEM = resource.Certificate
 	m.keyPEM = resource.PrivateKey
 	m.commonName = x509Cert.Subject.CommonName
 	m.issuedAt = time.Now()
+
+	m.mu.Lock()
+	m.tlsCert = &tlsCert
 	m.notAfter = x509Cert.NotAfter
 	m.mu.Unlock()
 
 	return nil
-}
-
-// recordError records err as the manager's most recent error, for status-page display. Sticky
-// across subsequent successful renewals, the same way the last error is reported elsewhere in
-// this codebase (e.g. pmaas-plugin-porkbun's DnsRecordData) - it's "the last error that ever
-// happened", not "the current error state".
-func (m *Manager) recordError(err error) {
-	m.mu.Lock()
-	m.lastErrorMessage = err.Error()
-	m.lastErrorTime = time.Now()
-	m.mu.Unlock()
 }
 
 // ensureRegistered registers the ACME account if user.Registration isn't already set (either
@@ -269,6 +310,28 @@ func (m *Manager) ensureRegistered() error {
 	return nil
 }
 
+// currentState snapshots the manager's account/certificate data for Config.OnStateChanged.
+// Called only from Run's own goroutine, same as every field it reads except notAfter.
+func (m *Manager) currentState() State {
+	state := State{
+		AccountPrivateKeyPEM: certcrypto.PEMEncode(m.user.PrivateKey),
+		CertificatePEM:       m.certPEM,
+		CertificateKeyPEM:    m.keyPEM,
+		CommonName:           m.commonName,
+		IssuedAt:             m.issuedAt,
+	}
+
+	m.mu.RLock()
+	state.NotAfter = m.notAfter
+	m.mu.RUnlock()
+
+	if m.user.Registration != nil {
+		state.RegistrationURI = m.user.Registration.URI
+	}
+
+	return state
+}
+
 // GetCertificate matches tls.Config.GetCertificate's shape (see
 // IPMAASContainer.ProvideTLSCertificate) and is safe for concurrent use, since it's invoked
 // fresh on every incoming TLS handshake.
@@ -281,49 +344,4 @@ func (m *Manager) GetCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	}
 
 	return m.tlsCert, nil
-}
-
-// State returns a snapshot of the manager's current account/certificate state, suitable for
-// persisting via Config.InitialState on the next restart. CertificatePEM/CertificateKeyPEM are
-// empty if no certificate has been obtained yet.
-func (m *Manager) State() State {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	state := State{
-		AccountPrivateKeyPEM: certcrypto.PEMEncode(m.user.PrivateKey),
-		CertificatePEM:       m.certPEM,
-		CertificateKeyPEM:    m.keyPEM,
-		IssuedAt:             m.issuedAt,
-		NotAfter:             m.notAfter,
-	}
-
-	if m.user.Registration != nil {
-		state.RegistrationURI = m.user.Registration.URI
-	}
-
-	return state
-}
-
-// Status returns a read-only snapshot of the manager's account/certificate state, for
-// status-page display. Safe for concurrent use.
-func (m *Manager) Status() Status {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	status := Status{
-		Domains:          slices.Clone(m.domains),
-		Email:            m.user.Email,
-		CommonName:       m.commonName,
-		RefreshedTime:    m.issuedAt,
-		ExpiresTime:      m.notAfter,
-		LastErrorMessage: m.lastErrorMessage,
-		LastErrorTime:    m.lastErrorTime,
-	}
-
-	if m.user.Registration != nil {
-		status.RegistrationURI = m.user.Registration.URI
-	}
-
-	return status
 }
