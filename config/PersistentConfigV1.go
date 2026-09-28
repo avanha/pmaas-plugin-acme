@@ -16,5 +16,6 @@ type PersistentConfigV1 struct {
 
 	CertificatePEM    []byte
 	CertificateKeyPEM []byte
+	IssuedAt          time.Time
 	NotAfter          time.Time
 }

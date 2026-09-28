@@ -1,0 +1,44 @@
+.entity-acme-status {
+    display: flex;
+    flex-flow: column;
+}
+
+.entity-acme-status .monospace {
+    font-size: 10pt;
+    font-family: "Roboto", "Menlo", "Consolas", monospace;
+}
+
+.entity-acme-status .container {
+    display: flex;
+    flex-flow: row wrap;
+    margin: 0 0 5px 0;
+}
+
+.entity-acme-status .container > :not(:last-child) {
+    margin-right: 10px;
+}
+
+.entity-acme-status .container > * {
+    white-space: nowrap;
+}
+
+.entity-acme-status .container .container {
+    margin-bottom: 0;
+}
+
+.entity-acme-status .label::after {
+    content: ":";
+}
+
+.entity-acme-status .group-label {
+    font-weight: bold;
+}
+
+.entity-acme-status .group-label::after {
+    content: " - ";
+}
+
+.entity-acme-status .unknown {
+    color: grey;
+    font-style: italic;
+}

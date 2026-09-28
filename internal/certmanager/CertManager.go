@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -34,6 +35,7 @@ type State struct {
 
 	CertificatePEM    []byte
 	CertificateKeyPEM []byte
+	IssuedAt          time.Time
 	NotAfter          time.Time
 }
 
@@ -63,11 +65,31 @@ type Manager struct {
 	user   *acmeuser.User
 	client *lego.Client
 
-	mu       sync.RWMutex
-	tlsCert  *tls.Certificate
-	certPEM  []byte
-	keyPEM   []byte
-	notAfter time.Time
+	mu         sync.RWMutex
+	tlsCert    *tls.Certificate
+	certPEM    []byte
+	keyPEM     []byte
+	commonName string
+	issuedAt   time.Time
+	notAfter   time.Time
+
+	lastErrorMessage string
+	lastErrorTime    time.Time
+}
+
+// Status is a read-only snapshot of the manager's account/certificate state, for status-page
+// display.
+type Status struct {
+	Domains         []string
+	Email           string
+	RegistrationURI string
+
+	CommonName    string
+	RefreshedTime time.Time
+	ExpiresTime   time.Time
+
+	LastErrorMessage string
+	LastErrorTime    time.Time
 }
 
 func NewManager(cfg Config) (*Manager, error) {
@@ -124,13 +146,16 @@ func NewManager(cfg Config) (*Manager, error) {
 
 	if len(cfg.InitialState.CertificatePEM) > 0 && len(cfg.InitialState.CertificateKeyPEM) > 0 {
 		tlsCert, err := tls.X509KeyPair(cfg.InitialState.CertificatePEM, cfg.InitialState.CertificateKeyPEM)
+		x509Cert, x509Err := certcrypto.ParsePEMCertificate(cfg.InitialState.CertificatePEM)
 
-		if err != nil {
-			fmt.Printf("certmanager: discarding persisted certificate, unable to parse: %v\n", err)
+		if err != nil || x509Err != nil {
+			fmt.Printf("certmanager: discarding persisted certificate, unable to parse: %v\n", errors.Join(err, x509Err))
 		} else {
 			m.tlsCert = &tlsCert
 			m.certPEM = cfg.InitialState.CertificatePEM
 			m.keyPEM = cfg.InitialState.CertificateKeyPEM
+			m.commonName = x509Cert.Subject.CommonName
+			m.issuedAt = cfg.InitialState.IssuedAt
 			m.notAfter = cfg.InitialState.NotAfter
 		}
 	}
@@ -172,6 +197,7 @@ func (m *Manager) EnsureCertificate() error {
 	}
 
 	if err := m.ensureRegistered(); err != nil {
+		m.recordError(err)
 		return err
 	}
 
@@ -181,27 +207,46 @@ func (m *Manager) EnsureCertificate() error {
 	})
 
 	if err != nil {
-		return fmt.Errorf("certmanager: obtaining certificate: %w", err)
+		err = fmt.Errorf("certmanager: obtaining certificate: %w", err)
+		m.recordError(err)
+		return err
 	}
 
 	x509Cert, err := certcrypto.ParsePEMCertificate(resource.Certificate)
 	if err != nil {
-		return fmt.Errorf("certmanager: parsing issued certificate: %w", err)
+		err = fmt.Errorf("certmanager: parsing issued certificate: %w", err)
+		m.recordError(err)
+		return err
 	}
 
 	tlsCert, err := tls.X509KeyPair(resource.Certificate, resource.PrivateKey)
 	if err != nil {
-		return fmt.Errorf("certmanager: building TLS certificate: %w", err)
+		err = fmt.Errorf("certmanager: building TLS certificate: %w", err)
+		m.recordError(err)
+		return err
 	}
 
 	m.mu.Lock()
 	m.tlsCert = &tlsCert
 	m.certPEM = resource.Certificate
 	m.keyPEM = resource.PrivateKey
+	m.commonName = x509Cert.Subject.CommonName
+	m.issuedAt = time.Now()
 	m.notAfter = x509Cert.NotAfter
 	m.mu.Unlock()
 
 	return nil
+}
+
+// recordError records err as the manager's most recent error, for status-page display. Sticky
+// across subsequent successful renewals, the same way the last error is reported elsewhere in
+// this codebase (e.g. pmaas-plugin-porkbun's DnsRecordData) - it's "the last error that ever
+// happened", not "the current error state".
+func (m *Manager) recordError(err error) {
+	m.mu.Lock()
+	m.lastErrorMessage = err.Error()
+	m.lastErrorTime = time.Now()
+	m.mu.Unlock()
 }
 
 // ensureRegistered registers the ACME account if user.Registration isn't already set (either
@@ -249,6 +294,7 @@ func (m *Manager) State() State {
 		AccountPrivateKeyPEM: certcrypto.PEMEncode(m.user.PrivateKey),
 		CertificatePEM:       m.certPEM,
 		CertificateKeyPEM:    m.keyPEM,
+		IssuedAt:             m.issuedAt,
 		NotAfter:             m.notAfter,
 	}
 
@@ -257,4 +303,27 @@ func (m *Manager) State() State {
 	}
 
 	return state
+}
+
+// Status returns a read-only snapshot of the manager's account/certificate state, for
+// status-page display. Safe for concurrent use.
+func (m *Manager) Status() Status {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	status := Status{
+		Domains:          slices.Clone(m.domains),
+		Email:            m.user.Email,
+		CommonName:       m.commonName,
+		RefreshedTime:    m.issuedAt,
+		ExpiresTime:      m.notAfter,
+		LastErrorMessage: m.lastErrorMessage,
+		LastErrorTime:    m.lastErrorTime,
+	}
+
+	if m.user.Registration != nil {
+		status.RegistrationURI = m.user.Registration.URI
+	}
+
+	return status
 }

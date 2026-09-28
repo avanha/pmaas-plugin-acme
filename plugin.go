@@ -10,7 +10,9 @@ import (
 	spi "github.com/avanha/pmaas-spi"
 
 	"github.com/avanha/pmaas-plugin-acme/config"
+	"github.com/avanha/pmaas-plugin-acme/data"
 	"github.com/avanha/pmaas-plugin-acme/internal/certmanager"
+	"github.com/avanha/pmaas-plugin-acme/internal/http"
 )
 
 const (
@@ -22,6 +24,7 @@ type plugin struct {
 	config      config.PluginConfig
 	container   spi.IPMAASContainer
 	certManager *certmanager.Manager
+	httpHandler *http.Handler
 
 	cancelFn  context.CancelFunc
 	workersWg sync.WaitGroup
@@ -36,7 +39,7 @@ func NewPluginConfig() config.PluginConfig {
 }
 
 func NewPlugin(conf config.PluginConfig) Plugin {
-	return &plugin{config: conf}
+	return &plugin{config: conf, httpHandler: http.NewHandler()}
 }
 
 func (p *plugin) ShortName() string {
@@ -65,12 +68,29 @@ func (p *plugin) Init(container spi.IPMAASContainer) {
 	}
 
 	p.certManager = certManager
+	p.httpHandler.Init(container, p)
 
 	// Must happen during Init or Start, before Start returns - see
 	// IPMAASContainer.ProvideTLSCertificate. GetCertificate itself returns an error for any
 	// handshake that arrives before the first certificate has been obtained (see Start).
 	if err := container.ProvideTLSCertificate(p.certManager.GetCertificate); err != nil {
 		panic(fmt.Errorf("%T failed to register as the TLS certificate provider: %w", p, err))
+	}
+}
+
+// GetStatus implements internal/http.StatusProvider, for the plugin's status page.
+func (p *plugin) GetStatus() data.PluginStatus {
+	status := p.certManager.Status()
+
+	return data.PluginStatus{
+		Domains:          status.Domains,
+		Email:            status.Email,
+		RegistrationURI:  status.RegistrationURI,
+		CommonName:       status.CommonName,
+		RefreshedTime:    status.RefreshedTime,
+		ExpiresTime:      status.ExpiresTime,
+		LastErrorMessage: status.LastErrorMessage,
+		LastErrorTime:    status.LastErrorTime,
 	}
 }
 
@@ -97,6 +117,7 @@ func (p *plugin) loadPersistedState() certmanager.State {
 		RegistrationURI:      persisted.RegistrationURI,
 		CertificatePEM:       persisted.CertificatePEM,
 		CertificateKeyPEM:    persisted.CertificateKeyPEM,
+		IssuedAt:             persisted.IssuedAt,
 		NotAfter:             persisted.NotAfter,
 	}
 }
@@ -180,6 +201,7 @@ func (p *plugin) obtainAndPersist() error {
 		RegistrationURI:      state.RegistrationURI,
 		CertificatePEM:       state.CertificatePEM,
 		CertificateKeyPEM:    state.CertificateKeyPEM,
+		IssuedAt:             state.IssuedAt,
 		NotAfter:             state.NotAfter,
 	})
 

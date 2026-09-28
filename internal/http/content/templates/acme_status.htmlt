@@ -1,0 +1,58 @@
+<div class="entity-acme-status">
+    <div class="container">
+        <div class="group-label">Account</div>
+        <div class="container nowrap">
+            <div class="label">Email</div>
+            <div class="value">
+                {{if .Email}}{{.Email}}{{else}}<span class="unknown">Not configured</span>{{end}}
+            </div>
+        </div>
+        <div class="container nowrap">
+            <div class="label">Registration</div>
+            <div class="value monospace">
+                {{if .RegistrationURI}}{{.RegistrationURI}}{{else}}<span class="unknown">Not registered yet</span>{{end}}
+            </div>
+        </div>
+    </div>
+    <div class="container">
+        <div class="group-label">Certificate</div>
+        <div class="container nowrap">
+            <div class="label">Common Name</div>
+            <div class="value">
+                {{if .CommonName}}{{.CommonName}}{{else}}<span class="unknown">No certificate yet</span>{{end}}
+            </div>
+        </div>
+        <div class="container nowrap">
+            <div class="label">Domains</div>
+            <div class="value">{{range $i, $domain := .Domains}}{{if $i}}, {{end}}{{$domain}}{{end}}</div>
+        </div>
+        <div class="container nowrap">
+            <div class="label">Refreshed</div>
+            <div class="timestamp">
+                {{if .RefreshedTime.IsZero}}Never{{else}}{{.RefreshedTime.Format "2006-01-02 3:04:05 PM"}}{{end}}
+            </div>
+        </div>
+        <div class="container nowrap">
+            <div class="label">Expires</div>
+            <div class="timestamp">
+                {{if .ExpiresTime.IsZero}}Unknown{{else}}{{.ExpiresTime.Format "2006-01-02 3:04:05 PM"}}{{end}}
+            </div>
+        </div>
+    </div>
+    <div class="container">
+        <div class="group-label">Last Error</div>
+        <div class="container nowrap">
+            <div class="label">Time</div>
+            <div class="timestamp">
+                {{if .LastErrorTime.IsZero}}
+                    Never
+                {{else}}
+                    {{.LastErrorTime.Format "2006-01-02 3:04:05 PM"}}
+                {{end}}
+            </div>
+            {{if not .LastErrorTime.IsZero}}
+                <div class="value monospace">{{.LastErrorMessage}}</div>
+            {{end}}
+        </div>
+    </div>
+</div>
