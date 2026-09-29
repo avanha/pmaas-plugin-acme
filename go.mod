@@ -3,7 +3,7 @@ module github.com/avanha/pmaas-plugin-acme
 go 1.27.1
 
 require (
-	github.com/avanha/pmaas-spi v0.0.7
+	github.com/avanha/pmaas-spi v0.0.8
 	github.com/go-acme/lego/v4 v4.35.2
 )
 
