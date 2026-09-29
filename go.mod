@@ -20,3 +20,5 @@ require (
 	golang.org/x/text v0.36.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
 )
+
+replace github.com/avanha/pmaas-spi => ../pmaas-spi
