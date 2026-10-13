@@ -4,13 +4,13 @@
         <div class="container nowrap">
             <div class="label">Email</div>
             <div class="value">
-                {{if .Email}}{{.Email}}{{else}}<span class="unknown">Not configured</span>{{end}}
+                {{if .Email}}{{.Email | html}}{{else}}<span class="unknown">Not configured</span>{{end}}
             </div>
         </div>
         <div class="container nowrap">
             <div class="label">Registration</div>
             <div class="value monospace">
-                {{if .RegistrationURI}}{{.RegistrationURI}}{{else}}<span class="unknown">Not registered yet</span>{{end}}
+                {{if .RegistrationURI}}{{.RegistrationURI | html}}{{else}}<span class="unknown">Not registered yet</span>{{end}}
             </div>
         </div>
     </div>
@@ -19,12 +19,12 @@
         <div class="container nowrap">
             <div class="label">Common Name</div>
             <div class="value">
-                {{if .CommonName}}{{.CommonName}}{{else}}<span class="unknown">No certificate yet</span>{{end}}
+                {{if .CommonName}}{{.CommonName | html}}{{else}}<span class="unknown">No certificate yet</span>{{end}}
             </div>
         </div>
         <div class="container nowrap">
             <div class="label">Domains</div>
-            <div class="value">{{range $i, $domain := .Domains}}{{if $i}}, {{end}}{{$domain}}{{end}}</div>
+            <div class="value">{{range $i, $domain := .Domains}}{{if $i}}, {{end}}{{$domain | html}}{{end}}</div>
         </div>
         <div class="container nowrap">
             <div class="label">Refreshed</div>
@@ -51,7 +51,7 @@
                 {{end}}
             </div>
             {{if not .LastErrorTime.IsZero}}
-                <div class="value monospace">{{.LastErrorMessage}}</div>
+                <div class="value monospace">{{.LastErrorMessage | html}}</div>
             {{end}}
         </div>
     </div>
